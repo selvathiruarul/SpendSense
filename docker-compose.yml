@@ -1,0 +1,51 @@
+version: "3.9"
+
+# SpendSense v2 - Python / FastAPI / Streamlit / SQLite / Ollama
+#
+# Development (recommended): Run backend + frontend locally without Docker.
+#   See README for local dev instructions.
+#
+# Full Docker: uncomment the backend/frontend services below and run:
+#   docker compose up
+
+services:
+  # Ollama runs locally on your Mac — not in Docker — for best GPU/Metal support.
+  # Start it with: ollama serve  (then: ollama pull llama3.2)
+  #
+  # Uncomment below only if you want Ollama containerized (CPU only):
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama_data:/root/.ollama
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: sqlite:///./data/spendsense.db
+      OLLAMA_HOST: http://host.docker.internal:11434
+      OLLAMA_MODEL: llama3.2
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+    driver: local

@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-log.txt
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Data (SQLite DB — keep the dir but not the DB file)
+data/*.db
+data/*.sqlite
+data/uploads/
+
+# Streamlit cache
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker
+.docker/
+
+# Node (legacy, can be removed)
+node_modules/
+
+# Legacy files from old PostgreSQL/Node.js stack
+schema.sql
