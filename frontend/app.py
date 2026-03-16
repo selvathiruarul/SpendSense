@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import json
 
+import os
+
 import httpx
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
-API_BASE = "http://localhost:8000"
+API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 
 st.set_page_config(
     page_title="SpendSense",

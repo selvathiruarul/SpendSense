@@ -124,9 +124,13 @@ async def upload_statement(
     if ext not in (".pdf", ".csv"):
         raise HTTPException(status_code=400, detail="Only PDF and CSV files are supported.")
 
+    content = await file.read()
+    if len(content) > 10_000_000:
+        raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
+
     # Write upload to a temp file (pdfplumber/pandas need a file path)
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(await file.read())
+        tmp.write(content)
         tmp_path = tmp.name
 
     try:
