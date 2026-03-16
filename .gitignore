@@ -23,8 +23,8 @@ data/*.db
 data/*.sqlite
 data/uploads/
 
-# Streamlit cache
-.streamlit/
+# Streamlit (secrets only — config.toml is committed)
+.streamlit/secrets.toml
 
 # IDE
 .vscode/
