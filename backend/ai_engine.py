@@ -47,6 +47,7 @@ TAXONOMY: dict[str, list[str]] = {
     ],
     # Non-expense / special
     "Income": ["Salary", "Tax Refund", "Other"],
+    "Investment": ["Brokerage Transfer", "Retirement", "Savings Transfer", "Other"],
     "Refund": ["Return", "Credit", "Other"],
     "Payment": ["Credit Card Payment", "Other"],
 }
@@ -67,8 +68,15 @@ _PAYMENT_PATTERNS = re.compile(
 _INCOME_PATTERNS = re.compile(
     r"(direct\s+deposit|payroll|salary|paycheck|"
     r"tax\s+refund|irs\s+treas|zelle\s+from|venmo\s+from|"
-    r"t-osv|moneyline|claim\s+reim|reimbursement|employer|"
+    r"t-osv|claim\s+reim|reimbursement|employer|"
     r"ppd\s+id|web\s+id.*deposit)",
+    re.IGNORECASE,
+)
+
+_INVESTMENT_PATTERNS = re.compile(
+    r"(robinhood|fidelity|schwab|vanguard|etrade|e\*trade|"
+    r"td\s+ameritrade|merrill|coinbase|betterment|wealthfront|"
+    r"moneyline|fid\s+bkg|investment\s+transfer|brokerage)",
     re.IGNORECASE,
 )
 
@@ -76,7 +84,7 @@ _INCOME_PATTERNS = re.compile(
 
 def _build_system_prompt(is_cc: bool) -> str:
     taxonomy_lines = []
-    skip = {"Income", "Refund", "Payment"}
+    skip = {"Income", "Investment", "Refund", "Payment"}
     for cat, subs in TAXONOMY.items():
         if cat in skip:
             continue
@@ -95,7 +103,9 @@ def _build_system_prompt(is_cc: bool) -> str:
             "- [DEPOSIT] transactions → likely Income (Salary, reimbursement, transfer in)\n"
             "- [WITHDRAWAL] transactions → expense categories\n"
             "- Employer payroll, direct deposit, reimbursements → Income / Salary\n"
-            "- Investment transfers (Robinhood, Fidelity) → Miscellaneous / Other\n"
+            "- Robinhood, Fidelity, Schwab, brokerage transfers → Investment / Brokerage Transfer\n"
+            "- 401k, IRA, retirement contributions → Investment / Retirement\n"
+            "- Savings account transfers → Investment / Savings Transfer\n"
             "- Loan payments, mortgage → Home / Mortgage/EMI or Transportation / Auto Loan/Lease\n"
         )
 
@@ -145,6 +155,9 @@ def categorize_all(
 
     needs_ai = []
     for tx in transactions:
+        # Skip AI if already categorized by a learned rule (set by main.py before this call)
+        if tx.get("_from_rule"):
+            continue
         pre_cat, pre_sub = _pre_classify(tx["raw_desc"], is_cc=is_cc, amount=tx.get("amount", 0.0))
         if pre_cat:
             tx["category"] = pre_cat
@@ -164,6 +177,8 @@ def _pre_classify(raw_desc: str, is_cc: bool = True, amount: float = 0.0) -> tup
     """Return (category, subcategory) or (None, None) to fall through to AI."""
     if _PAYMENT_PATTERNS.search(raw_desc):
         return "Payment", "Credit Card Payment"
+    if _INVESTMENT_PATTERNS.search(raw_desc):
+        return "Investment", "Brokerage Transfer"
     # For checking/savings: positive amount matching income patterns → Income
     if not is_cc and amount > 0 and _INCOME_PATTERNS.search(raw_desc):
         return "Income", "Salary"

@@ -91,53 +91,64 @@ def parse_csv(file_path: str) -> list[dict]:
 
 # ── Section-aware text parser ─────────────────────────────────────────────────
 
-# Section headers that signal "we are now in a transaction list"
-_TX_SECTION_HEADERS = re.compile(
-    r"(purchases?\s+and\s+adjustments?|account\s+activity|transactions?|"
-    r"purchases?|payments?\s+and\s+credits?|fees?|interest\s+charged)",
-    re.IGNORECASE,
-)
-
-# Section headers that signal "done with transactions"
+# Sections we know contain NO transactions — skip everything inside them.
+# Easier to maintain than trying to name every bank's transaction section header.
 _NON_TX_SECTION_HEADERS = re.compile(
     r"(interest\s+charge\s+calculation|account\s+summary|rewards\s+summary|"
-    r"important\s+disclosures?|your\s+account\s+messages?|page\s+\d)",
+    r"important\s+disclosures?|your\s+account\s+messages?|page\s+\d|"
+    r"activity\s+and\s+promotions?\s+detail|year.to.date\s+totals?|"
+    r"\d{4}\s+totals?\s+year.to.date|how\s+to\s+avoid|if\s+you\s+think|"
+    r"please\s+send|customer\s+service|visit\s+us\s+at)",
     re.IGNORECASE,
 )
 
-# Lines to always skip regardless of section
+# Lines to always skip regardless of where they appear.
+# Covers summary/header rows that happen to contain a date or number.
 _SKIP_PATTERNS = re.compile(
     r"(total\s+fees|total\s+interest|minimum\s+payment|new\s+balance"
     r"|previous\s+balance|credit\s+limit|available\s+credit"
-    r"|opening\/closing|statement\s+period|annual\s+percentage)",
+    r"|opening\/closing|statement\s+period|annual\s+percentage"
+    r"|payment\s+due\s+date|account\s+number|reference\s+#"
+    r"|trans\s+date|posting\s+date|transaction\s+date"
+    r"|total\s+fees\s+for|total\s+interest\s+for"
+    r"|days\s+in\s+billing|promotional\s+balance"
+    r"|no\s+int\s+w\/pymts|regular\s+purchases?|cash\s+advance\s+fee)",
     re.IGNORECASE,
 )
 
 
 def _parse_text_page(text: str, stmt_year: int, stmt_month: int) -> list[dict]:
     """
-    Parse transactions from a page's text, tracking which section we're in.
-    Only accepts lines while inside a known transaction section.
+    Parse transactions from a page's text.
+
+    Strategy: try every line — no need to recognise each bank's section header.
+    We only skip lines that are inside known *non-transaction* sections (summaries,
+    disclosures, etc.) or match known noise patterns.  This makes the parser
+    work across all bank PDF formats without per-bank tuning.
     """
     txs = []
-    in_tx_section = False
+    in_skip_section = False
 
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
 
-        # Check section transitions
-        if _TX_SECTION_HEADERS.search(stripped):
-            in_tx_section = True
-            continue
+        # Enter / exit known non-transaction sections
         if _NON_TX_SECTION_HEADERS.search(stripped):
-            in_tx_section = False
-            continue
-        if _SKIP_PATTERNS.search(stripped):
+            in_skip_section = True
             continue
 
-        if not in_tx_section:
+        # A short all-caps header that looks like a section title (e.g. "TRANSACTIONS",
+        # "PURCHASES", "FEES") resets back to parse mode.
+        if re.match(r"^[A-Z][A-Z\s&/]{2,40}$", stripped) and len(stripped.split()) <= 5:
+            in_skip_section = False
+            continue
+
+        if in_skip_section:
+            continue
+
+        if _SKIP_PATTERNS.search(stripped):
             continue
 
         tx = _parse_text_line(stripped, stmt_year, stmt_month)
@@ -156,21 +167,33 @@ def _parse_text_line(line: str, stmt_year: int, stmt_month: int) -> dict | None:
     if not line or len(line) < 10:
         return None
 
-    # Detect AMOUNT BALANCE pattern (checking statements: two numbers at end)
-    # e.g. "-200.00 31,313.94" — take the first (amount), discard second (balance)
-    two_nums = re.search(
-        r"([-+]?\(?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)\s+(\d{1,3}(?:,\d{3})*\.\d{2})$",
+    # Pattern: DECIMAL_AMOUNT  DECIMAL_BALANCE  (checking: "-200.00 31,313.94")
+    # Take the first number (amount), discard second (running balance).
+    two_decimals = re.search(
+        r"([-+]?\(?\d{1,3}(?:,\d{3})*\.\d{2}\)?)\s+(\d{1,3}(?:,\d{3})*\.\d{2})$",
         line,
     )
-    if two_nums:
-        amount = _try_parse_amount(two_nums.group(1))
+    if two_decimals:
+        amount = _try_parse_amount(two_decimals.group(1))
         if amount is not None:
-            remainder = line[: two_nums.start()].strip()
-            # Fall through to date parsing below
+            remainder = line[: two_decimals.start()].strip()
             return _finish_tx_line(remainder, amount, stmt_year, stmt_month)
 
-    # Single amount at end of line (credit card / simple format)
-    amount_match = re.search(r"[-+]?\(?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?$", line)
+    # Pattern: DECIMAL_AMOUNT  WHOLE_NUMBER  (rewards cards: "-12.82 1,282")
+    # The trailing whole number is reward points — take the decimal amount, discard points.
+    decimal_then_whole = re.search(
+        r"([-+]?\(?\d{1,3}(?:,\d{3})*\.\d{2}\)?)\s+(\d{1,3}(?:,\d{3})*)$",
+        line,
+    )
+    if decimal_then_whole:
+        amount = _try_parse_amount(decimal_then_whole.group(1))
+        if amount is not None:
+            remainder = line[: decimal_then_whole.start()].strip()
+            return _finish_tx_line(remainder, amount, stmt_year, stmt_month)
+
+    # Single amount at end of line.
+    # Also handles Citi "$ 30.00-" format (optional leading $, trailing minus).
+    amount_match = re.search(r"\$?\s*[-+]?\(?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?-?$", line)
     if not amount_match:
         return None
     amount = _try_parse_amount(amount_match.group())
@@ -191,6 +214,7 @@ def _finish_tx_line(remainder: str, amount: float, stmt_year: int, stmt_month: i
         r"|\d{4}[\/\-]\d{2}[\/\-]\d{2}"             # YYYY-MM-DD
         r"|\d{1,2}[\s\-][A-Za-z]{3}[\s\-]\d{2,4}"  # 15-Jan-2026
         r"|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}"      # January 15, 2026
+        r"|[A-Za-z]{3}\s+\d{1,2}"                   # Jan 15  (Capital One / no year)
         r"|\d{1,2}\/\d{1,2}"                         # MM/DD (no year)
         r")",
         remainder,
@@ -214,10 +238,23 @@ def _finish_tx_line(remainder: str, amount: float, stmt_year: int, stmt_month: i
 def _parse_table_row(
     row: list, stmt_year: int | None = None, stmt_month: int | None = None
 ) -> dict | None:
-    """Try to parse a PDF table row as a transaction."""
+    """Try to parse a PDF table row as a transaction.
+
+    Some PDFs (e.g. Amex rewards cards) merge the dollar amount into the
+    description cell: "AMAZON MARKETPLACE -12.82", and put reward points
+    (whole numbers like 1,282) in a separate column.  We handle this by:
+    1. Splitting any description cell that ends with a number → embedded amount.
+    2. Categorising standalone numeric cells as decimal (dollar) or whole-number
+       (likely points/rewards).
+    3. Priority: embedded decimal > standalone decimal > standalone whole number.
+    """
     date_str = None
     raw_desc = None
-    amount = None
+    embedded_amount: float | None = None   # amount found inside a description cell
+    decimal_amounts: list[float] = []      # standalone cells like -12.82
+    whole_amounts: list[float] = []        # standalone cells like 1,282 (no decimal)
+
+    _trailing_num = re.compile(r"\s+([-+]?\(?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\)?)$")
 
     for cell in row:
         if cell is None:
@@ -232,14 +269,28 @@ def _parse_table_row(
                 date_str = parsed
                 continue
 
-        if amount is None:
-            parsed_amt = _try_parse_amount(cell)
-            if parsed_amt is not None:
-                amount = parsed_amt
-                continue
+        # Pure numeric cell?
+        parsed_amt = _try_parse_amount(cell)
+        if parsed_amt is not None:
+            clean = re.sub(r"[$,\s()]", "", cell)
+            if "." in clean:
+                decimal_amounts.append(parsed_amt)
+            else:
+                whole_amounts.append(parsed_amt)
+            continue
 
-        if raw_desc is None and len(cell) > 3 and not cell.replace(" ", "").isdigit():
+        # Text cell — check if it ends with an embedded amount (e.g. "MERCHANT -12.82")
+        m = _trailing_num.search(cell)
+        if m:
+            emb = _try_parse_amount(m.group(1))
+            if emb is not None and embedded_amount is None:
+                embedded_amount = emb
+                cell = cell[: m.start()].strip()   # strip amount from description
+
+        if raw_desc is None and len(cell) > 3:
             raw_desc = cell
+
+    amount = embedded_amount or (decimal_amounts or whole_amounts or [None])[0]
 
     if date_str and raw_desc and amount is not None:
         return {"date": date_str, "raw_desc": raw_desc, "amount": amount}
@@ -351,6 +402,20 @@ def _try_parse_date(
         except ValueError:
             continue
 
+    # Mon DD with no year  (Capital One: "Jan 15", "Dec 3")
+    mon_day = re.match(r"^([A-Za-z]{3})\s+(\d{1,2})$", s)
+    if mon_day:
+        tx_month = _MONTH_NAMES.get(mon_day.group(1).lower())
+        if tx_month:
+            tx_day = int(mon_day.group(2))
+            base_year = stmt_year or date.today().year
+            base_month = stmt_month or date.today().month
+            year = base_year if tx_month <= base_month else base_year - 1
+            try:
+                return datetime(year, tx_month, tx_day).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
     # MM/DD with no year
     mo_day = re.match(r"^(\d{1,2})\/(\d{1,2})$", s)
     if mo_day:
@@ -371,8 +436,11 @@ def _try_parse_date(
 
 
 def _try_parse_amount(s: str) -> float | None:
-    """Return float or None. Handles $, commas, parentheses (negatives)."""
+    """Return float or None. Handles $, commas, parentheses, trailing minus (Citi)."""
     s = re.sub(r"[$,\s]", "", s.strip())
+    # Trailing minus: "30.00-" → "-30.00"  (Citi / Best Buy Citi format)
+    if s.endswith("-") and not s.startswith("-") and not s.startswith("("):
+        s = "-" + s[:-1]
     if s.startswith("(") and s.endswith(")"):
         s = "-" + s[1:-1]
     try:
