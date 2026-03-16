@@ -642,6 +642,16 @@ def delete_rule(rule_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
+@app.delete("/transactions/{tx_id}", status_code=204)
+def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
+    """Delete a single transaction by ID."""
+    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+    db.delete(tx)
+    db.commit()
+
+
 @app.delete("/transactions", status_code=200)
 def clear_transactions(
     year: Optional[int] = None,
