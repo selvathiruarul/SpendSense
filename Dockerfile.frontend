@@ -3,7 +3,7 @@ FROM python:3.13-slim
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir streamlit plotly httpx
+RUN pip install --no-cache-dir streamlit plotly httpx streamlit-aggrid
 
 COPY frontend/ ./frontend/
 

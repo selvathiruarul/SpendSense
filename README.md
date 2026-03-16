@@ -61,7 +61,7 @@ Upload bank statements (PDF or CSV), let a local AI categorize everything, then 
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/your-username/SpendSense.git
+git clone https://github.com/selvathiruarul/SpendSense.git
 cd SpendSense
 
 # 2. Install dependencies

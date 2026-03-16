@@ -47,5 +47,11 @@ logs/
 # Node (legacy, can be removed)
 node_modules/
 
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Legacy files from old PostgreSQL/Node.js stack
 schema.sql
+docs/
