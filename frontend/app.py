@@ -120,12 +120,25 @@ if page == "Dashboard":
     import calendar as _dash_cal
 
     today = _dash_date.today()
-    cur_year, cur_month = today.year, today.month
-    month_name = _dash_cal.month_name[cur_month]
-
     st.title("Dashboard")
 
-    summary_cur = api_get(f"/summary?year={cur_year}&month={cur_month}") or {}
+    # Year / Month filter
+    _dash_years = list(range(2020, today.year + 1))
+    _dash_months = {i: _dash_cal.month_name[i] for i in range(1, 13)}
+    df1, df2 = st.columns([1, 1])
+    with df1:
+        sel_year = st.selectbox("Year", _dash_years,
+                                index=_dash_years.index(today.year), key="dash_year")
+    with df2:
+        sel_month = st.selectbox("Month", [0] + list(range(1, 13)),
+                                 format_func=lambda m: "All months" if m == 0 else _dash_months[m],
+                                 index=today.month, key="dash_month")
+    month_name = "All months" if sel_month == 0 else _dash_cal.month_name[sel_month]
+
+    if sel_month:
+        summary_cur = api_get(f"/summary?year={sel_year}&month={sel_month}") or {}
+    else:
+        summary_cur = api_get(f"/summary?year={sel_year}") or {}
     monthly = api_get("/monthly") or {}
     budgets = api_get("/budgets") or []
     all_txs = api_get("/transactions?limit=2000") or []
@@ -136,7 +149,8 @@ if page == "Dashboard":
     savings_pct = round(savings / income * 100, 1) if income > 0 else 0.0
     tx_count = summary_cur.get("total_transactions", 0)
 
-    st.subheader(f"{month_name} {cur_year} — At a Glance")
+    period_label = f"{month_name} {sel_year}" if sel_month else str(sel_year)
+    st.subheader(f"{period_label} — At a Glance")
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Income", f"${income:,.2f}")
     k2.metric("Expenses", f"${expenses:,.2f}", delta_color="inverse",
@@ -148,7 +162,7 @@ if page == "Dashboard":
     EXPENSE_CATS = {"Transportation", "Home", "Utilities", "Health", "Entertainment", "Miscellaneous"}
 
     with col_left:
-        st.subheader("Spending This Month")
+        st.subheader(f"Spending — {period_label}")
         cat_data = {k: abs(v) for k, v in summary_cur.get("by_category", {}).items() if k in EXPENSE_CATS}
         if cat_data:
             pie_df = pd.DataFrame({"Category": list(cat_data.keys()), "Amount": list(cat_data.values())})
@@ -195,14 +209,22 @@ if page == "Dashboard":
             )
             c3.markdown(f"{icon} **{actual_pct}%** of income")
 
-    # Recent transactions
+    # Transactions for selected period
     st.markdown("---")
-    st.subheader("Recent Transactions")
+    st.subheader(f"Transactions — {period_label}")
     if all_txs:
-        recent = sorted(all_txs, key=lambda x: x["date"], reverse=True)[:15]
-        r_df = pd.DataFrame(recent)[["date", "merchant", "category", "amount", "account"]]
-        r_df["amount"] = r_df["amount"].apply(lambda x: f"${abs(x):,.2f}" if x < 0 else f"+${x:,.2f}")
-        st.dataframe(r_df, use_container_width=True, hide_index=True)
+        if sel_month:
+            period_prefix = f"{sel_year}-{sel_month:02d}"
+            period_txs = [t for t in all_txs if t["date"].startswith(period_prefix)]
+        else:
+            period_txs = [t for t in all_txs if t["date"].startswith(str(sel_year))]
+        recent = sorted(period_txs, key=lambda x: x["date"], reverse=True)
+        if recent:
+            r_df = pd.DataFrame(recent)[["date", "merchant", "category", "amount", "account"]]
+            r_df["amount"] = r_df["amount"].apply(lambda x: f"${abs(x):,.2f}" if x < 0 else f"+${x:,.2f}")
+            st.dataframe(r_df, use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No transactions for {period_label}.")
     else:
         st.info("No transactions yet. Upload a statement to get started.")
 
@@ -441,7 +463,9 @@ elif page == "Transactions":
 
     st.caption(f"Showing {len(df)} transactions · Double-click a cell to edit")
 
-    grid_df = df[["id", "date", "account", "merchant", "raw_desc", "category", "subcategory", "amount", "is_reviewed"]].copy()
+    if "notes" not in df.columns:
+        df["notes"] = ""
+    grid_df = df[["id", "date", "account", "merchant", "raw_desc", "notes", "category", "subcategory", "amount", "is_reviewed"]].copy()
 
     # JS function: subcategory options depend on the category value in the same row
     subcat_params = JsCode(f"""
@@ -458,6 +482,7 @@ elif page == "Transactions":
     gb.configure_column("account", header_name="Account", editable=True, width=160)
     gb.configure_column("merchant", header_name="Merchant", editable=True, flex=2)
     gb.configure_column("raw_desc", header_name="Description", editable=False, flex=2)
+    gb.configure_column("notes", header_name="Notes", editable=True, flex=1)
     gb.configure_column(
         "category",
         header_name="Category",
@@ -489,6 +514,7 @@ elif page == "Transactions":
         cellEditor="agCheckboxCellEditor",
         width=100,
     )
+    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
     gb.configure_grid_options(stopEditingWhenCellsLoseFocus=True)
 
     grid_response = AgGrid(
@@ -501,7 +527,31 @@ elif page == "Transactions":
         height=450,
     )
 
-    if st.button("Save Changes", type="primary"):
+    btn_col1, btn_col2 = st.columns([1, 5])
+    with btn_col1:
+        delete_clicked = st.button("Delete Selected", type="secondary")
+    with btn_col2:
+        save_clicked = st.button("Save Changes", type="primary")
+
+    if delete_clicked:
+        selected = grid_response.get("selected_rows")
+        if selected is None or (hasattr(selected, "__len__") and len(selected) == 0):
+            st.warning("Select one or more rows first (use the checkboxes).")
+        else:
+            selected_list = selected if isinstance(selected, list) else selected.to_dict("records")
+            deleted = 0
+            for row in selected_list:
+                try:
+                    r = httpx.delete(f"{API_BASE}/transactions/{int(row['id'])}", timeout=10)
+                    if r.status_code == 204:
+                        deleted += 1
+                except Exception:
+                    pass
+            if deleted:
+                st.success(f"Deleted {deleted} transaction(s).")
+                st.rerun()
+
+    if save_clicked:
         edited_df = grid_response["data"]
         changes = 0
         for _, orig_row in df.iterrows():
@@ -520,6 +570,8 @@ elif page == "Transactions":
                 updates["account"] = new_row["account"] or None
             if round(float(new_row["amount"]), 2) != round(float(orig_row["amount"]), 2):
                 updates["amount"] = float(new_row["amount"])
+            if str(new_row.get("notes", "") or "") != str(orig_row.get("notes", "") or ""):
+                updates["notes"] = new_row.get("notes") or None
             if bool(new_row["is_reviewed"]) != bool(orig_row["is_reviewed"]):
                 updates["is_reviewed"] = bool(new_row["is_reviewed"])
             if updates:
@@ -865,6 +917,95 @@ elif page == "Reports":
                             httpx.delete(f"{API_BASE}/budgets/{b['id']}", timeout=5)
                 st.success("Budget plan saved.")
                 st.rerun()
+
+    # ── Income Breakdown ──────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Income")
+    income_data = api_get(f"/income?year={filter_year}") or {}
+    if income_data.get("total", 0) > 0:
+        inc1, inc2 = st.columns(2)
+        with inc1:
+            if income_data.get("by_month"):
+                inc_df = pd.DataFrame({
+                    "Month": list(income_data["by_month"].keys()),
+                    "Income": list(income_data["by_month"].values()),
+                })
+                fig_inc = px.bar(inc_df, x="Month", y="Income", color_discrete_sequence=["#59a14f"],
+                                 labels={"Income": "Amount ($)"}, title=f"Monthly Income — {filter_year}")
+                fig_inc.update_layout(xaxis_tickangle=-45, xaxis_type="category", margin=dict(t=40))
+                inc1.plotly_chart(fig_inc, use_container_width=True)
+        with inc2:
+            if income_data.get("by_source"):
+                src_df = pd.DataFrame({
+                    "Source": list(income_data["by_source"].keys()),
+                    "Amount": list(income_data["by_source"].values()),
+                })
+                fig_src = px.pie(src_df, names="Source", values="Amount", hole=0.4,
+                                 title="Income by Source")
+                fig_src.update_traces(textposition="inside", textinfo="percent+label")
+                inc2.plotly_chart(fig_src, use_container_width=True)
+        st.caption(f"Total income {filter_year}: **${income_data['total']:,.2f}**")
+        with st.expander("Income Transactions", expanded=False):
+            inc_txs = income_data.get("transactions", [])
+            if inc_txs:
+                inc_tx_df = pd.DataFrame(inc_txs)[["date", "merchant", "subcategory", "amount", "account"]]
+                inc_tx_df = inc_tx_df.sort_values("date", ascending=False)
+                st.dataframe(inc_tx_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No income data for this period. Make sure income transactions are categorized as 'Income'.")
+
+    # ── Recurring Transactions ────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Recurring Transactions")
+    st.caption("Merchants that appear in 2+ months with a consistent amount — likely subscriptions or fixed bills.")
+    recurring = api_get("/recurring") or []
+    if recurring:
+        rec_df = pd.DataFrame(recurring)
+        rec_df["months_seen"] = rec_df["months_seen"].apply(lambda x: ", ".join(x))
+        rec_df = rec_df.rename(columns={
+            "merchant": "Merchant", "category": "Category", "subcategory": "Subcategory",
+            "avg_amount": "Avg/Month ($)", "total_spent": "Total Spent ($)",
+            "occurrences": "Times", "months_seen": "Months Seen",
+        })
+        st.dataframe(rec_df[["Merchant", "Category", "Subcategory", "Avg/Month ($)", "Times", "Total Spent ($)", "Months Seen"]],
+                     use_container_width=True, hide_index=True)
+        total_recurring = sum(r["avg_amount"] for r in recurring)
+        st.caption(f"Estimated recurring spend: **${total_recurring:,.2f}/month** across {len(recurring)} merchants")
+    else:
+        st.info("No recurring transactions detected yet. Upload at least 2 months of statements.")
+
+    # ── Budget Trend ──────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Budget Trend")
+    st.caption(f"Monthly budget vs actual across {filter_year}.")
+    trend_data = api_get(f"/budget-trend?year={filter_year}") or {}
+    trend_months = trend_data.get("months", [])
+    trend_cats = trend_data.get("categories", [])
+    if trend_months and trend_cats:
+        trend_df = pd.DataFrame(trend_months)
+        # Build a grouped bar chart for Savings (most important) + any category with a budget
+        for cat in trend_cats:
+            t_col = f"{cat}_target"
+            a_col = f"{cat}_actual"
+            if t_col not in trend_df.columns:
+                continue
+            cat_rows = []
+            for _, row in trend_df.iterrows():
+                cat_rows.append({"Month": row["month"], "Type": "Actual", "Amount": row.get(a_col, 0)})
+                cat_rows.append({"Month": row["month"], "Type": "Target", "Amount": row.get(t_col, 0)})
+            cat_df = pd.DataFrame(cat_rows)
+            fig_trend = px.bar(
+                cat_df, x="Month", y="Amount", color="Type", barmode="group",
+                color_discrete_map={"Actual": "#4e79a7", "Target": "#bab0ac"},
+                title=f"{cat}: Actual vs Target",
+                labels={"Amount": "Amount ($)"},
+            )
+            fig_trend.update_layout(xaxis_tickangle=-45, xaxis_type="category", margin=dict(t=40), height=260)
+            st.plotly_chart(fig_trend, use_container_width=True)
+    elif budgets:
+        st.info("Need at least 1 month of data with income transactions to show trends.")
+    else:
+        st.info("Set budget targets above to enable trend tracking.")
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.markdown("---")
