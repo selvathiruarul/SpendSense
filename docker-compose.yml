@@ -28,13 +28,18 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+    env_file:
+      - .env
     environment:
-      DATABASE_URL: sqlite:///./data/spendsense.db
       OLLAMA_HOST: http://host.docker.internal:11434
-      OLLAMA_MODEL: llama3.2
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   frontend:
     build:
@@ -42,10 +47,13 @@ services:
       dockerfile: Dockerfile.frontend
     ports:
       - "8501:8501"
+    env_file:
+      - .env
     environment:
       API_BASE: http://backend:8000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

@@ -23,19 +23,28 @@ from backend.database import Base, engine, get_db
 from backend.models import Transaction, MerchantRule, BudgetTarget
 from backend.parser import parse_file
 from backend.ai_engine import categorize_all
+from backend.auth import UserClaims, get_current_user
+from backend.billing import router as billing_router
 
 load_dotenv()
+
+# Free tier limits
+FREE_UPLOADS_PER_MONTH = int(os.getenv("FREE_UPLOADS_PER_MONTH", "3"))
+FREE_TRANSACTIONS_MAX = int(os.getenv("FREE_TRANSACTIONS_MAX", "100"))
 
 # Create database tables on startup
 Base.metadata.create_all(bind=engine)
 
-# Migrations: add columns introduced after initial schema
+# Migrations: add columns introduced after initial schema (SQLite-safe)
 from sqlalchemy import text as _text
 with engine.connect() as _conn:
     for _col_ddl in [
         "ALTER TABLE transactions ADD COLUMN subcategory VARCHAR",
         "ALTER TABLE transactions ADD COLUMN account VARCHAR",
         "ALTER TABLE transactions ADD COLUMN notes VARCHAR",
+        "ALTER TABLE transactions ADD COLUMN user_id VARCHAR",
+        "ALTER TABLE budget_targets ADD COLUMN user_id VARCHAR",
+        "ALTER TABLE merchant_rules ADD COLUMN user_id VARCHAR",
     ]:
         try:
             _conn.execute(_text(_col_ddl))
@@ -52,15 +61,20 @@ with engine.connect() as _conn:
     except Exception:
         pass
 
-app = FastAPI(title="SpendSense API", version="2.1.0")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8501")
+
+app = FastAPI(title="SpendSense API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501"],  # Streamlit default port
+    allow_origins=[FRONTEND_URL, "http://localhost:8501"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register billing routes (Stripe checkout / portal / webhook)
+app.include_router(billing_router)
 
 
 # ── Request/Response schemas ──────────────────────────────────────────────────
@@ -97,11 +111,41 @@ class BudgetCreate(BaseModel):
     percentage: float   # 0–100 (% of monthly income)
 
 
+# ── Usage limit helper ────────────────────────────────────────────────────────
+
+def _check_upload_limit(user: UserClaims, db: Session) -> None:
+    """Raise 402 if a free-tier user has hit their monthly upload limit."""
+    if user.is_paid:
+        return
+    from datetime import date as _date
+    today = _date.today()
+    month_start = _date(today.year, today.month, 1)
+    uploads_this_month = (
+        db.query(Transaction)
+        .filter(
+            Transaction.user_id == user.id,
+            Transaction.source_file != "manual",
+            Transaction.date >= month_start,
+        )
+        .with_entities(Transaction.source_file)
+        .distinct()
+        .count()
+    )
+    if uploads_this_month >= FREE_UPLOADS_PER_MONTH:
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"Free plan allows {FREE_UPLOADS_PER_MONTH} uploads per month. "
+                "Upgrade to Pro for unlimited uploads."
+            ),
+        )
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "SpendSense API", "version": "2.0.0"}
+    return {"status": "ok", "service": "SpendSense API", "version": "3.0.0"}
 
 
 @app.post("/upload")
@@ -110,14 +154,17 @@ async def upload_statement(
     account_type: str = Form("credit_card"),  # "credit_card" | "checking" | "savings"
     account: str = Form(""),                  # human label e.g. "Chase Checking"
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
     """
     Upload a bank statement (PDF or CSV).
     account_type controls whether credits can be Income:
       - credit_card: credits are Refund (never Income)
       - checking/savings: credits matching payroll patterns are Income
-    Pipeline: parse -> AI categorize -> save to SQLite.
+    Pipeline: parse -> AI categorize -> save to DB.
     """
+    _check_upload_limit(current_user, db)
+
     filename = file.filename or ""
     ext = Path(filename).suffix.lower()
 
@@ -128,7 +175,6 @@ async def upload_statement(
     if len(content) > 10_000_000:
         raise HTTPException(status_code=413, detail="File exceeds 10 MB limit.")
 
-    # Write upload to a temp file (pdfplumber/pandas need a file path)
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
@@ -147,8 +193,11 @@ async def upload_statement(
             ),
         )
 
-    # Load learned merchant rules and apply before AI (fuzzy match)
-    rules = {r.merchant.lower(): r for r in db.query(MerchantRule).all()}
+    # Load this user's learned merchant rules
+    rules = {
+        r.merchant.lower(): r
+        for r in db.query(MerchantRule).filter(MerchantRule.user_id == current_user.id).all()
+    }
     for tx in raw_txs:
         merchant_key = _clean_merchant(tx["raw_desc"]).lower()
         matched_rule = _fuzzy_find_rule(merchant_key, rules)
@@ -157,10 +206,8 @@ async def upload_statement(
             tx["subcategory"] = matched_rule.subcategory
             tx["_from_rule"] = True
 
-    # AI categorization for transactions not covered by rules
     categorized = categorize_all(raw_txs, account_type=account_type)
 
-    # Persist to DB — skip exact duplicates (same date + amount + description)
     saved_count = 0
     skipped_count = 0
     for tx in categorized:
@@ -168,6 +215,7 @@ async def upload_statement(
         exists = (
             db.query(Transaction)
             .filter(
+                Transaction.user_id == current_user.id,
                 Transaction.date == tx_date,
                 Transaction.amount == tx["amount"],
                 Transaction.raw_desc == tx["raw_desc"],
@@ -179,6 +227,7 @@ async def upload_statement(
             continue
 
         db_tx = Transaction(
+            user_id=current_user.id,
             date=tx_date,
             merchant=_clean_merchant(tx["raw_desc"]),
             raw_desc=tx["raw_desc"],
@@ -202,9 +251,9 @@ def list_transactions(
     limit: int = 500,
     category: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Return transactions, optionally filtered by category."""
-    q = db.query(Transaction)
+    q = db.query(Transaction).filter(Transaction.user_id == current_user.id)
     if category:
         q = q.filter(Transaction.category == category)
     txs = q.order_by(Transaction.date.asc()).offset(skip).limit(limit).all()
@@ -217,11 +266,9 @@ def bulk_assign_account(
     category: Optional[str] = None,
     merchant: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Assign an account name to all transactions matching category and/or merchant.
-    Must be defined BEFORE /{tx_id} to avoid FastAPI routing conflict.
-    """
-    q = db.query(Transaction)
+    q = db.query(Transaction).filter(Transaction.user_id == current_user.id)
     if category:
         q = q.filter(Transaction.category == category)
     if merchant:
@@ -237,9 +284,13 @@ def update_transaction(
     tx_id: int,
     data: TransactionUpdate,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Update category, merchant, or is_reviewed flag on a transaction."""
-    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    tx = (
+        db.query(Transaction)
+        .filter(Transaction.id == tx_id, Transaction.user_id == current_user.id)
+        .first()
+    )
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found.")
 
@@ -258,24 +309,33 @@ def update_transaction(
     if data.is_reviewed is not None:
         tx.is_reviewed = data.is_reviewed
 
-    # When user marks reviewed, save/update a merchant rule and apply
-    # it retroactively to all unreviewed transactions with the same merchant.
     if data.is_reviewed and tx.category:
         merchant_key = tx.merchant.lower()
-        rule = db.query(MerchantRule).filter(MerchantRule.merchant == merchant_key).first()
+        rule = (
+            db.query(MerchantRule)
+            .filter(MerchantRule.user_id == current_user.id, MerchantRule.merchant == merchant_key)
+            .first()
+        )
         final_cat = tx.category
         final_sub = tx.subcategory
         if rule:
             rule.category = final_cat
             rule.subcategory = final_sub
         else:
-            db.add(MerchantRule(merchant=merchant_key, category=final_cat, subcategory=final_sub))
+            db.add(MerchantRule(
+                user_id=current_user.id,
+                merchant=merchant_key,
+                category=final_cat,
+                subcategory=final_sub,
+            ))
 
-        # Apply retroactively to all unreviewed transactions with a fuzzy-matching
-        # merchant name — catches slight description variations for the same payee
         all_unreviewed = (
             db.query(Transaction)
-            .filter(Transaction.is_reviewed == False, Transaction.id != tx_id)
+            .filter(
+                Transaction.user_id == current_user.id,
+                Transaction.is_reviewed == False,
+                Transaction.id != tx_id,
+            )
             .all()
         )
         for s in all_unreviewed:
@@ -293,13 +353,13 @@ def split_transaction(
     tx_id: int,
     splits: list[SplitItem],
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """
-    Replace a transaction with 2+ splits.
-    Each split inherits date, source_file, account, and is_reviewed from the original.
-    The original transaction is deleted.
-    """
-    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    tx = (
+        db.query(Transaction)
+        .filter(Transaction.id == tx_id, Transaction.user_id == current_user.id)
+        .first()
+    )
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found.")
     if len(splits) < 2:
@@ -308,6 +368,7 @@ def split_transaction(
     new_txs = []
     for s in splits:
         new_txs.append(Transaction(
+            user_id=current_user.id,
             date=tx.date,
             merchant=s.merchant or tx.merchant,
             raw_desc=tx.raw_desc,
@@ -327,13 +388,17 @@ def split_transaction(
 
 
 @app.post("/transactions", status_code=201)
-def create_transaction(data: TransactionCreate, db: Session = Depends(get_db)):
-    """Manually add a single transaction (cash, etc.)."""
+def create_transaction(
+    data: TransactionCreate,
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
     try:
         tx_date = datetime.strptime(data.date, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
     tx = Transaction(
+        user_id=current_user.id,
         date=tx_date,
         merchant=data.merchant.strip(),
         raw_desc=data.merchant.strip(),
@@ -358,15 +423,15 @@ def export_csv(
     account: Optional[str] = None,
     category: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Return all matching transactions as a CSV file download."""
     import calendar
     import csv
     import io
     from datetime import date as _date
     from fastapi.responses import StreamingResponse
 
-    q = db.query(Transaction)
+    q = db.query(Transaction).filter(Transaction.user_id == current_user.id)
     if year and month:
         q = q.filter(
             Transaction.date >= _date(year, month, 1),
@@ -390,25 +455,41 @@ def export_csv(
             "amount": tx.amount, "account": tx.account, "notes": tx.notes, "is_reviewed": tx.is_reviewed,
         })
     buf.seek(0)
-    filename = f"spendsense_{'_'.join(str(x) for x in [year, month, account] if x)or 'all'}.csv"
+    filename = f"spendsense_{'_'.join(str(x) for x in [year, month, account] if x) or 'all'}.csv"
     return StreamingResponse(buf, media_type="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 @app.get("/budgets")
-def list_budgets(db: Session = Depends(get_db)):
-    return [b.to_dict() for b in db.query(BudgetTarget).order_by(BudgetTarget.category).all()]
+def list_budgets(
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
+    return [
+        b.to_dict()
+        for b in db.query(BudgetTarget)
+        .filter(BudgetTarget.user_id == current_user.id)
+        .order_by(BudgetTarget.category)
+        .all()
+    ]
 
 
 @app.post("/budgets", status_code=201)
-def upsert_budget(data: BudgetCreate, db: Session = Depends(get_db)):
-    """Create or update a percentage budget target for a category."""
-    existing = db.query(BudgetTarget).filter(BudgetTarget.category == data.category).first()
+def upsert_budget(
+    data: BudgetCreate,
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
+    existing = (
+        db.query(BudgetTarget)
+        .filter(BudgetTarget.user_id == current_user.id, BudgetTarget.category == data.category)
+        .first()
+    )
     if existing:
         existing.percentage = data.percentage
         db.commit()
         db.refresh(existing)
         return existing.to_dict()
-    b = BudgetTarget(category=data.category, percentage=data.percentage)
+    b = BudgetTarget(user_id=current_user.id, category=data.category, percentage=data.percentage)
     db.add(b)
     db.commit()
     db.refresh(b)
@@ -416,8 +497,16 @@ def upsert_budget(data: BudgetCreate, db: Session = Depends(get_db)):
 
 
 @app.delete("/budgets/{budget_id}", status_code=204)
-def delete_budget(budget_id: int, db: Session = Depends(get_db)):
-    b = db.query(BudgetTarget).filter(BudgetTarget.id == budget_id).first()
+def delete_budget(
+    budget_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
+    b = (
+        db.query(BudgetTarget)
+        .filter(BudgetTarget.id == budget_id, BudgetTarget.user_id == current_user.id)
+        .first()
+    )
     if not b:
         raise HTTPException(status_code=404, detail="Budget not found.")
     db.delete(b)
@@ -429,13 +518,11 @@ def get_summary(
     year: Optional[int] = None,
     month: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Spending summary grouped by category, plus totals.
-    Optional ?year=2025&month=1 to filter to a single month.
-    """
     import calendar
     from datetime import date as _date
-    q = db.query(Transaction)
+    q = db.query(Transaction).filter(Transaction.user_id == current_user.id)
     if year and month:
         q = q.filter(
             Transaction.date >= _date(year, month, 1),
@@ -462,8 +549,6 @@ def get_summary(
         if cat not in by_subcategory:
             by_subcategory[cat] = {}
         by_subcategory[cat][sub] = round(by_subcategory[cat].get(sub, 0.0) + abs(tx.amount), 2)
-        # Use category (not sign) to determine expense vs income
-        # Investment/Payment/Refund excluded from both totals
         if cat in EXPENSE_CATEGORIES:
             total_spent += abs(tx.amount)
         elif cat == "Income":
@@ -486,10 +571,19 @@ def get_summary(
 
 
 @app.get("/monthly")
-def get_monthly(db: Session = Depends(get_db)):
-    """Monthly spending totals (expense categories only)."""
+def get_monthly(
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
     EXPENSE_CATEGORIES = {"Transportation", "Home", "Utilities", "Health", "Entertainment", "Miscellaneous"}
-    txs = db.query(Transaction).filter(Transaction.category.in_(EXPENSE_CATEGORIES)).all()
+    txs = (
+        db.query(Transaction)
+        .filter(
+            Transaction.user_id == current_user.id,
+            Transaction.category.in_(EXPENSE_CATEGORIES),
+        )
+        .all()
+    )
 
     monthly: dict[str, float] = {}
     for tx in txs:
@@ -500,12 +594,21 @@ def get_monthly(db: Session = Depends(get_db)):
 
 
 @app.get("/recurring")
-def get_recurring(db: Session = Depends(get_db)):
-    """Detect merchants that appear in 2+ different months with a consistent amount — potential subscriptions."""
+def get_recurring(
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
     from collections import defaultdict
 
     EXCLUDE = {"Income", "Payment", "Refund", "Investment"}
-    txs = db.query(Transaction).filter(Transaction.category.notin_(EXCLUDE)).all()
+    txs = (
+        db.query(Transaction)
+        .filter(
+            Transaction.user_id == current_user.id,
+            Transaction.category.notin_(EXCLUDE),
+        )
+        .all()
+    )
 
     by_merchant: dict[str, list] = defaultdict(list)
     for tx in txs:
@@ -527,7 +630,6 @@ def get_recurring(db: Session = Depends(get_db)):
             continue
         amounts = [e["amount"] for e in entries]
         avg_amount = sum(amounts) / len(amounts)
-        # Consistent if max deviation < 10% of avg or < $5
         if max(amounts) - min(amounts) < max(avg_amount * 0.10, 5.0):
             recurring.append({
                 "merchant": entries[0]["merchant"],
@@ -546,11 +648,14 @@ def get_recurring(db: Session = Depends(get_db)):
 def get_income(
     year: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Monthly income totals plus breakdown by subcategory (source)."""
     from datetime import date as _date
 
-    q = db.query(Transaction).filter(Transaction.category == "Income")
+    q = db.query(Transaction).filter(
+        Transaction.user_id == current_user.id,
+        Transaction.category == "Income",
+    )
     if year:
         q = q.filter(Transaction.date >= _date(year, 1, 1), Transaction.date <= _date(year, 12, 31))
     txs = q.order_by(Transaction.date.asc()).all()
@@ -575,15 +680,19 @@ def get_income(
 def get_budget_trend(
     year: Optional[int] = None,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Monthly budget vs actual comparison across all months in a year."""
     import calendar
     from datetime import date as _date
 
     if not year:
         year = _date.today().year
 
-    budgets = db.query(BudgetTarget).all()
+    budgets = (
+        db.query(BudgetTarget)
+        .filter(BudgetTarget.user_id == current_user.id)
+        .all()
+    )
     if not budgets:
         return {"months": [], "categories": []}
 
@@ -591,12 +700,16 @@ def get_budget_trend(
 
     EXPENSE_CATEGORIES = {"Transportation", "Home", "Utilities", "Health", "Entertainment", "Miscellaneous"}
 
-    txs = db.query(Transaction).filter(
-        Transaction.date >= _date(year, 1, 1),
-        Transaction.date <= _date(year, 12, 31),
-    ).all()
+    txs = (
+        db.query(Transaction)
+        .filter(
+            Transaction.user_id == current_user.id,
+            Transaction.date >= _date(year, 1, 1),
+            Transaction.date <= _date(year, 12, 31),
+        )
+        .all()
+    )
 
-    # Aggregate per month
     months_data: dict[str, dict] = {}
     for tx in txs:
         key = tx.date.strftime("%Y-%m")
@@ -630,16 +743,30 @@ def get_budget_trend(
 
 
 @app.get("/rules")
-def list_rules(db: Session = Depends(get_db)):
-    """Return all learned merchant rules."""
-    rules = db.query(MerchantRule).order_by(MerchantRule.merchant).all()
+def list_rules(
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
+    rules = (
+        db.query(MerchantRule)
+        .filter(MerchantRule.user_id == current_user.id)
+        .order_by(MerchantRule.merchant)
+        .all()
+    )
     return [r.to_dict() for r in rules]
 
 
 @app.delete("/rules/{rule_id}", status_code=204)
-def delete_rule(rule_id: int, db: Session = Depends(get_db)):
-    """Delete a learned merchant rule."""
-    rule = db.query(MerchantRule).filter(MerchantRule.id == rule_id).first()
+def delete_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
+    rule = (
+        db.query(MerchantRule)
+        .filter(MerchantRule.id == rule_id, MerchantRule.user_id == current_user.id)
+        .first()
+    )
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found.")
     db.delete(rule)
@@ -647,9 +774,16 @@ def delete_rule(rule_id: int, db: Session = Depends(get_db)):
 
 
 @app.delete("/transactions/{tx_id}", status_code=204)
-def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
-    """Delete a single transaction by ID."""
-    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+def delete_transaction(
+    tx_id: int,
+    db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
+):
+    tx = (
+        db.query(Transaction)
+        .filter(Transaction.id == tx_id, Transaction.user_id == current_user.id)
+        .first()
+    )
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found.")
     db.delete(tx)
@@ -662,14 +796,11 @@ def clear_transactions(
     month: Optional[int] = None,
     account: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: UserClaims = Depends(get_current_user),
 ):
-    """Delete transactions. Optionally filter by year, month, and/or account.
-    Without any params, deletes all transactions.
-    Returns count of deleted rows.
-    """
     import calendar
     from datetime import date as _date
-    q = db.query(Transaction)
+    q = db.query(Transaction).filter(Transaction.user_id == current_user.id)
     if year and month:
         q = q.filter(
             Transaction.date >= _date(year, month, 1),
@@ -689,12 +820,10 @@ def clear_transactions(
 
 
 @app.post("/debug-parse")
-async def debug_parse(file: UploadFile = File(...)):
-    """
-    Dry-run parse — returns what the parser extracted WITHOUT saving to DB.
-    Use this to diagnose why a file yields no transactions.
-    Also returns raw page text so you can see the PDF layout.
-    """
+async def debug_parse(
+    file: UploadFile = File(...),
+    current_user: UserClaims = Depends(get_current_user),
+):
     import pdfplumber
 
     filename = file.filename or ""
@@ -707,7 +836,6 @@ async def debug_parse(file: UploadFile = File(...)):
     try:
         parsed = parse_file(tmp_path)
 
-        # For PDFs, also return raw page text to help debug layout
         raw_pages = []
         if ext == ".pdf":
             with pdfplumber.open(tmp_path) as pdf:
@@ -731,62 +859,28 @@ async def debug_parse(file: UploadFile = File(...)):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _clean_merchant(raw_desc: str) -> str:
-    """Strip bank noise to get a normalised merchant name for rule matching.
-
-    Handles these common bank description patterns:
-    - ACH ids:          "Clear Link T-Osv 0000688549 PPD ID: 00000741" → "Clear Link T-Osv"
-    - Store numbers:    "WHOLE FOODS #1234"                             → "WHOLE FOODS"
-    - Ref codes:        "AMZN MKTP US*AB1234"                          → "AMZN MKTP US"
-    - Location IDs:     "SHELL OIL 57444404003"                        → "SHELL OIL"
-    - City/state:       "WALMART SUPERCENTER AUSTIN TX"                → "WALMART SUPERCENTER"
-    - URL noise:        "AMAZON AMZN.COM/BILL"                         → "AMAZON"
-    """
     clean = raw_desc.strip()
-
-    # ACH identifiers and everything after (PPD/WEB/CCD) — strip FIRST so the
-    # numeric reference ID before them becomes a trailing number removed below.
     clean = re.sub(r"\s+(PPD|WEB|CCD)\b.*$", "", clean, flags=re.IGNORECASE).strip()
-
-    # Store/location numbers like #1234
     clean = re.sub(r"\s+#\d+", "", clean).strip()
-
-    # Asterisk ref codes like *AB1234CD (Amex / Amazon style)
     clean = re.sub(r"\*\S+$", "", clean).strip()
-
-    # URL-like tokens (contain a dot or slash, e.g. AMZN.COM/BILL)
     clean = re.sub(r"\s+\S*[/.]\S+", "", clean).strip()
-
-    # Alphanumeric reference codes (Citi: "7426937B8EYB6LXHW") — 10+ char mixed tokens
     clean = re.sub(r"\s+[A-Z0-9]{10,}\b", "", clean).strip()
-
-    # Long numeric sequences (8+ digits) — transaction/location/account IDs
     clean = re.sub(r"\s+\d{8,}", "", clean).strip()
-
-    # Trailing 5–7 digit codes (location codes, store IDs, zip codes)
     clean = re.sub(r"\s+\d{5,7}$", "", clean).strip()
-
-    # Trailing city + 2-letter state abbreviation: "AUSTIN TX", "SAN FRANCISCO CA"
     clean = re.sub(r"\s+[A-Z][A-Z ]{1,20}\s+[A-Z]{2}$", "", clean).strip()
-
-    # Lone 2-letter state abbreviation remaining after the city was stripped
     clean = re.sub(r"\s+[A-Z]{2}$", "", clean).strip()
-
-    # Short trailing numbers (3–4 digits, e.g. card last-4)
     clean = re.sub(r"\s+\d{3,4}$", "", clean).strip()
-
     return clean[:60]
 
 
-_FUZZY_THRESHOLD = 0.82  # similarity ratio (0–1); tune up to reduce false positives
+_FUZZY_THRESHOLD = 0.82
 
 
 def _fuzzy_match(a: str, b: str) -> bool:
-    """Return True if two merchant name strings are similar enough to be the same payee."""
     return SequenceMatcher(None, a, b).ratio() >= _FUZZY_THRESHOLD
 
 
-def _fuzzy_find_rule(merchant_key: str, rules: dict) -> MerchantRule | None:
-    """Return the best-matching rule for merchant_key (exact first, then fuzzy)."""
+def _fuzzy_find_rule(merchant_key: str, rules: dict) -> Optional[MerchantRule]:
     if merchant_key in rules:
         return rules[merchant_key]
     best_score, best_rule = 0.0, None

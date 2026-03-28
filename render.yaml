@@ -1,0 +1,35 @@
+---
+# Render.com deployment config
+# Push this repo to GitHub, then create a new Web Service in Render pointing to it.
+# Render will detect this file automatically.
+
+services:
+  - type: web
+    name: spendsense-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false          # paste Supabase PostgreSQL URL in Render dashboard
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID_PRO
+        sync: false
+      - key: FRONTEND_URL
+        sync: false          # e.g. https://your-app.streamlit.app
+      - key: OLLAMA_HOST
+        value: ""            # leave blank — cloud deploy uses API-based AI instead
+      - key: FREE_UPLOADS_PER_MONTH
+        value: "3"
+      - key: FREE_TRANSACTIONS_MAX
+        value: "100"
+    healthCheckPath: /

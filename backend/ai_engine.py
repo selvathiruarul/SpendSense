@@ -9,8 +9,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import ollama
 from dotenv import load_dotenv
+
+try:
+    import ollama
+    _OLLAMA_AVAILABLE = True
+except ImportError:
+    _OLLAMA_AVAILABLE = False
 
 load_dotenv()
 
@@ -215,6 +220,9 @@ def _categorize_batch(
     )
 
     try:
+        if not _OLLAMA_AVAILABLE:
+            raise RuntimeError("Ollama not installed — falling back to default categories.")
+
         response = ollama.chat(
             model=OLLAMA_MODEL,
             messages=[

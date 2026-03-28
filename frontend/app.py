@@ -5,16 +5,19 @@ Run with: streamlit run frontend/app.py
 from __future__ import annotations
 
 import json
-
 import os
 
 import httpx
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from dotenv import load_dotenv
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+load_dotenv()
 
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 
 st.set_page_config(
     page_title="SpendSense",
@@ -24,20 +27,139 @@ st.set_page_config(
 )
 
 
+# ── Supabase auth via direct HTTP (no supabase-py needed) ────────────────────
+
+def _sb_headers() -> dict:
+    return {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
+
+
+def _sb_signup(email: str, password: str) -> dict:
+    r = httpx.post(
+        f"{SUPABASE_URL}/auth/v1/signup",
+        headers=_sb_headers(),
+        json={"email": email, "password": password},
+        timeout=10,
+    )
+    return r.json(), r.is_success
+
+
+def _sb_login(email: str, password: str) -> dict:
+    r = httpx.post(
+        f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+        headers=_sb_headers(),
+        json={"email": email, "password": password},
+        timeout=10,
+    )
+    return r.json(), r.is_success
+
+
+def _sb_oauth_url(provider: str) -> str:
+    return f"{SUPABASE_URL}/auth/v1/authorize?provider={provider}&redirect_to={API_BASE}"
+
+
+# ── Auth gate — show login/signup if not authenticated ───────────────────────
+
+def _show_auth_page():
+    st.title("💰 SpendSense")
+    st.subheader("Sign in to your account")
+
+    tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
+
+    with tab_login:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Log in", use_container_width=True):
+            data, ok = _sb_login(email, password)
+            if ok and data.get("access_token"):
+                st.session_state["sb_session"] = data
+                st.rerun()
+            else:
+                st.error(f"Login failed: {data.get('error_description') or data.get('msg') or data}")
+
+        st.markdown("---")
+        if st.button("Continue with Google", use_container_width=True):
+            url = _sb_oauth_url("google")
+            st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
+
+    with tab_signup:
+        new_email = st.text_input("Email", key="signup_email")
+        new_pass = st.text_input("Password (min 8 chars)", type="password", key="signup_password")
+        if st.button("Create account", use_container_width=True):
+            data, ok = _sb_signup(new_email, new_pass)
+            if ok:
+                st.success("Account created! Check your email to confirm, then log in.")
+            else:
+                st.error(f"Sign-up failed: {data.get('error_description') or data.get('msg') or data}")
+
+
+# Dev mode: when SUPABASE_URL is not configured, skip auth entirely
+_DEV_MODE: bool = not SUPABASE_URL
+
+if _DEV_MODE:
+    _access_token = "dev"
+    _user_email = "local@dev"
+    _is_paid = True
+else:
+    if "sb_session" not in st.session_state:
+        _show_auth_page()
+        st.stop()
+    _session = st.session_state["sb_session"]
+    _access_token = _session.get("access_token", "")
+    _user_email = (_session.get("user") or {}).get("email", "")
+    _is_paid = ((_session.get("user") or {}).get("user_metadata") or {}).get("is_paid", False) is True
+
+
 # ── Sidebar navigation ────────────────────────────────────────────────────────
 
 st.sidebar.title("💰 SpendSense")
 page = st.sidebar.radio("Navigate", ["Dashboard", "Upload Statement", "Transactions", "Reports"])
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Backend: FastAPI · AI: Ollama · DB: SQLite")
+
+if _DEV_MODE:
+    st.sidebar.caption("Dev mode — auth disabled")
+else:
+    # Billing status
+    if _is_paid:
+        st.sidebar.success("Pro plan")
+        if st.sidebar.button("Manage billing"):
+            portal = httpx.get(
+                f"{API_BASE}/billing/portal",
+                headers={"Authorization": f"Bearer {_access_token}"},
+                timeout=10,
+            )
+            if portal.is_success:
+                st.sidebar.markdown(f'[Open Stripe portal]({portal.json()["portal_url"]})')
+    else:
+        st.sidebar.warning("Free plan — 3 uploads/month")
+        if st.sidebar.button("Upgrade to Pro — $4.99/mo"):
+            checkout = httpx.post(
+                f"{API_BASE}/billing/checkout",
+                headers={"Authorization": f"Bearer {_access_token}"},
+                timeout=10,
+            )
+            if checkout.is_success:
+                url = checkout.json()["checkout_url"]
+                st.sidebar.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"Signed in as {_user_email}")
+    if st.sidebar.button("Sign out"):
+        del st.session_state["sb_session"]
+        st.rerun()
+
+st.sidebar.caption("Backend: FastAPI · AI: Ollama · DB: PostgreSQL")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {_access_token}"}
+
+
 def api_get(path: str) -> dict | list | None:
     try:
-        r = httpx.get(f"{API_BASE}{path}", timeout=30)
+        r = httpx.get(f"{API_BASE}{path}", headers=_auth_headers(), timeout=30)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:
@@ -52,17 +174,20 @@ def api_post_file(path: str, file_bytes: bytes, filename: str, account_type: str
     try:
         r = httpx.post(
             f"{API_BASE}{path}",
+            headers=_auth_headers(),
             files={"file": (filename, file_bytes)},
             data={"account_type": account_type, "account": account},
             timeout=120,  # AI categorization can take a while
         )
         if not r.is_success:
-            # Show the actual error detail from the API, not just the status code
             try:
                 detail = r.json().get("detail", r.text)
             except Exception:
                 detail = r.text
-            st.error(f"Upload failed ({r.status_code}): {detail}")
+            if r.status_code == 402:
+                st.warning(f"{detail}  Use the sidebar to upgrade.")
+            else:
+                st.error(f"Upload failed ({r.status_code}): {detail}")
             return None
         return r.json()
     except httpx.ConnectError:
@@ -75,7 +200,7 @@ def api_post_file(path: str, file_bytes: bytes, filename: str, account_type: str
 
 def api_patch(path: str, data: dict) -> dict | None:
     try:
-        r = httpx.patch(f"{API_BASE}{path}", json=data, timeout=10)
+        r = httpx.patch(f"{API_BASE}{path}", headers=_auth_headers(), json=data, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -326,6 +451,7 @@ elif page == "Upload Statement":
         try:
             r = httpx.post(
                 f"{API_BASE}/debug-parse",
+                headers=_auth_headers(),
                 files={"file": (debug_file.name, debug_file.getvalue())},
                 timeout=60,
             )
@@ -397,7 +523,7 @@ elif page == "Upload Statement":
             if del_account != "All accounts":
                 params["account"] = del_account
             try:
-                r = httpx.delete(f"{API_BASE}/transactions", params=params, timeout=10)
+                r = httpx.delete(f"{API_BASE}/transactions", headers=_auth_headers(), params=params, timeout=10)
                 if r.is_success:
                     st.success(f"Deleted {r.json()['deleted']} transactions.")
                 else:
@@ -544,7 +670,7 @@ elif page == "Transactions":
             deleted = 0
             for row in selected_list:
                 try:
-                    r = httpx.delete(f"{API_BASE}/transactions/{int(row['id'])}", timeout=10)
+                    r = httpx.delete(f"{API_BASE}/transactions/{int(row['id'])}", headers=_auth_headers(), timeout=10)
                     if r.status_code == 204:
                         deleted += 1
                 except Exception:
@@ -627,7 +753,7 @@ elif page == "Transactions":
                     "note": at_note.strip() or None,
                 }
                 try:
-                    r = httpx.post(f"{API_BASE}/transactions", json=payload, timeout=10)
+                    r = httpx.post(f"{API_BASE}/transactions", headers=_auth_headers(), json=payload, timeout=10)
                     if r.is_success:
                         st.success(f"Added: {at_merchant.strip()} · ${at_amount:,.2f}")
                         st.rerun()
@@ -647,7 +773,7 @@ elif page == "Transactions":
             del_id = st.number_input("Delete rule by ID", min_value=1, step=1, key="del_rule_id")
             if st.button("Delete Rule", key="del_rule_btn"):
                 try:
-                    r = httpx.delete(f"{API_BASE}/rules/{int(del_id)}", timeout=10)
+                    r = httpx.delete(f"{API_BASE}/rules/{int(del_id)}", headers=_auth_headers(), timeout=10)
                     if r.status_code == 204:
                         st.success(f"Rule #{int(del_id)} deleted.")
                         st.rerun()
@@ -912,11 +1038,11 @@ elif page == "Reports":
             if st.form_submit_button("Save Budget Plan", type="primary"):
                 for cat, pct in budget_inputs.items():
                     if pct > 0:
-                        httpx.post(f"{API_BASE}/budgets", json={"category": cat, "percentage": pct}, timeout=5)
+                        httpx.post(f"{API_BASE}/budgets", headers=_auth_headers(), json={"category": cat, "percentage": pct}, timeout=5)
                     else:
                         b = budget_map.get(cat)
                         if b:
-                            httpx.delete(f"{API_BASE}/budgets/{b['id']}", timeout=5)
+                            httpx.delete(f"{API_BASE}/budgets/{b['id']}", headers=_auth_headers(), timeout=5)
                 st.success("Budget plan saved.")
                 st.rerun()
 
