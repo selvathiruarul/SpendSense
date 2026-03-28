@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Date, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Float, Date, Boolean, DateTime, UniqueConstraint
 from datetime import datetime
 from backend.database import Base
 
@@ -7,6 +7,7 @@ class Transaction(Base):
     __tablename__ = "transactions"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, nullable=False, index=True)   # Supabase user UUID
     date = Column(Date, nullable=False, index=True)
     merchant = Column(String, nullable=False)
     raw_desc = Column(String, nullable=False)
@@ -45,8 +46,11 @@ class BudgetTarget(Base):
     __tablename__ = "budget_targets"
 
     id = Column(Integer, primary_key=True, index=True)
-    category = Column(String, nullable=False, unique=True, index=True)
+    user_id = Column(String, nullable=False, index=True)   # Supabase user UUID
+    category = Column(String, nullable=False, index=True)
     percentage = Column(Float, nullable=False)   # 0–100
+
+    __table_args__ = (UniqueConstraint("user_id", "category", name="uq_budget_user_category"),)
 
     def to_dict(self):
         return {
@@ -63,10 +67,13 @@ class MerchantRule(Base):
     __tablename__ = "merchant_rules"
 
     id = Column(Integer, primary_key=True, index=True)
-    merchant = Column(String, nullable=False, unique=True, index=True)
+    user_id = Column(String, nullable=False, index=True)   # Supabase user UUID
+    merchant = Column(String, nullable=False, index=True)
     category = Column(String, nullable=False)
     subcategory = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (UniqueConstraint("user_id", "merchant", name="uq_rule_user_merchant"),)
 
     def to_dict(self):
         return {

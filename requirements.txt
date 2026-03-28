@@ -8,11 +8,19 @@ python-dotenv==1.0.1
 pdfplumber==0.11.4
 pandas==2.2.3
 
-# AI
+# AI — Ollama is optional. Works locally; gracefully skipped on Render (no GPU).
 ollama==0.4.4
 
 # Database
 sqlalchemy==2.0.36
+psycopg[binary]>=3.1.0    # PostgreSQL driver (Supabase) — pre-built wheel, no compilation needed
+
+# Auth
+# supabase client not needed — auth uses direct httpx calls to Supabase REST API
+httpx>=0.27.0,<0.28.0
+
+# Payments
+stripe==11.4.0
 
 # Testing
 pytest>=8.0.0
@@ -21,4 +29,3 @@ pytest>=8.0.0
 streamlit==1.41.1
 streamlit-aggrid>=1.0.0
 plotly==5.24.1
-httpx>=0.27.0,<0.28.0
