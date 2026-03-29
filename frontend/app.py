@@ -136,7 +136,7 @@ else:
             checkout = httpx.post(
                 f"{API_BASE}/billing/checkout",
                 headers={"Authorization": f"Bearer {_access_token}"},
-                timeout=10,
+                timeout=60,
             )
             if checkout.is_success:
                 url = checkout.json()["checkout_url"]
@@ -159,7 +159,7 @@ def _auth_headers() -> dict:
 
 def api_get(path: str) -> dict | list | None:
     try:
-        r = httpx.get(f"{API_BASE}{path}", headers=_auth_headers(), timeout=30)
+        r = httpx.get(f"{API_BASE}{path}", headers=_auth_headers(), timeout=60)
         r.raise_for_status()
         return r.json()
     except httpx.ConnectError:
