@@ -11,6 +11,7 @@ import httpx
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 load_dotenv()
@@ -18,6 +19,7 @@ load_dotenv()
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+STREAMLIT_URL = os.environ.get("STREAMLIT_URL", "http://localhost:8501")
 
 st.set_page_config(
     page_title="SpendSense",
@@ -26,6 +28,38 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── OAuth callback handler ────────────────────────────────────────────────────
+# Supabase redirects back with #access_token=... in the URL fragment.
+# Streamlit can't read fragments, so we inject JS to move it to a query param.
+
+components.html("""
+<script>
+const hash = window.location.hash.substring(1);
+if (hash && hash.includes('access_token')) {
+    const params = new URLSearchParams(hash);
+    const token = params.get('access_token');
+    if (token) {
+        const url = new URL(window.parent.location.href);
+        url.hash = '';
+        url.searchParams.set('oauth_token', token);
+        window.parent.location.replace(url.toString());
+    }
+}
+</script>
+""", height=0)
+
+# Check if we're returning from OAuth redirect
+if "oauth_token" in st.query_params and "sb_session" not in st.session_state:
+    token = st.query_params["oauth_token"]
+    resp = httpx.get(
+        f"{SUPABASE_URL}/auth/v1/user",
+        headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
+        timeout=10,
+    )
+    if resp.is_success:
+        st.session_state["sb_session"] = {"access_token": token, "user": resp.json()}
+        st.query_params.clear()
+        st.rerun()
 
 # ── Supabase auth via direct HTTP (no supabase-py needed) ────────────────────
 
@@ -54,7 +88,7 @@ def _sb_login(email: str, password: str) -> dict:
 
 
 def _sb_oauth_url(provider: str) -> str:
-    return f"{SUPABASE_URL}/auth/v1/authorize?provider={provider}&redirect_to={API_BASE}"
+    return f"{SUPABASE_URL}/auth/v1/authorize?provider={provider}&redirect_to={STREAMLIT_URL}"
 
 
 # ── Auth gate — show login/signup if not authenticated ───────────────────────
