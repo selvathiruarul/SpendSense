@@ -140,7 +140,7 @@ else:
             )
             if checkout.is_success:
                 url = checkout.json()["checkout_url"]
-                st.sidebar.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
+                st.sidebar.markdown(f'<a href="{url}" target="_blank">Click here to complete payment</a>', unsafe_allow_html=True)
 
     st.sidebar.markdown("---")
     st.sidebar.caption(f"Signed in as {_user_email}")
